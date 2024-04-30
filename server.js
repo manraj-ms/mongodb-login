@@ -18,36 +18,76 @@ const db = mongoose.connection;
 db.on('error', console.error.bind(console, 'MongoDB connection error:'));
 db.once('open', () => console.log('Connected to MongoDB database'));
 
-// Define MongoDB schema and models
 const userSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     address: { type: String, required: true },
     password: { type: String, required: true },
-    mobile_number: { type: String, required: true }
+    mobile_number: { type: String, required: true },
+    sessionTokens: [{ type: String }]
 });
 
 // Use the 'User' collection inside the 'newDB' database
 const User = mongoose.model('User', userSchema, 'User');
 
-// Variable to store active sessions
-let activeSessions = [];
-
-// Validate email format using regex
-function validateEmail(email) {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    return emailRegex.test(email);
+// Middleware for common successful response format
+function sendResponse(req, res, next) {
+    res.sendResponse = function (message, data) {
+        res.json({
+            success: true,
+            message: message,
+            data: data
+        });
+    };
+    next();
 }
 
-// Validate phone number format
-function validatePhoneNumber(mobile_number) {
-    const phoneRegex = /^9\d{9}$/;
-    return phoneRegex.test(mobile_number);
-}
+// Register common successful response middleware
+app.use(sendResponse);
 
-// Validate password complexity
-function validatePassword(password) {
-    return password.length >= 7 && /[!@#$%^&*(),.?":{}|<>]/.test(password);
+// Middleware to check token and manage sessions
+async function checkToken(req, res, next) {
+    // Extract token from request cookies
+    const token = req.cookies.token;
+
+    try {
+        if (!token) {
+            // Allow requests without a token for logout route
+            if (req.path === '/logout') {
+                return next();
+            }
+            const err = new Error("Token is missing");
+            err.status = 401;
+            throw err;
+        }
+
+        // Decrypt token
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        // Find the user in the database
+        const user = await User.findOne({ email: decoded.email });
+
+        // Check if user exists
+        if (!user) {
+            const err = new Error("User not found");
+            err.status = 401;
+            throw err;
+        }
+
+        // Check if token matches any of the session tokens stored in the user's sessionTokens array
+        if (!user.sessionTokens.includes(token)) {
+            const err = new Error("Invalid token");
+            err.status = 401;
+            throw err;
+        }
+
+        // Store user details in request for further processing
+        req.user = user;
+        req.token = token; // Store token for logout
+        next();
+    } catch (err) {
+        next(err);
+    }
 }
 
 // Login route
@@ -57,29 +97,32 @@ app.post('/login', async (req, res, next) => {
     try {
         // Check if email and password are provided
         if (!email || !password) {
-            const error = new Error("Email and password are required");
-            error.status = 400;
-            throw error;
+            const err = new Error("Email and password are required");
+            err.status = 400;
+            throw err;
         }
 
         // Find the user in the database
         const user = await User.findOne({ email, password });
         if (!user) {
-            const error = new Error("Invalid email or password");
-            error.status = 401;
-            throw error;
+            const err = new Error("Invalid email or password");
+            err.status = 401;
+            throw err;
         }
 
         // Generate JWT token for authentication
-        const token = jwt.sign({ email: user.email }, JWT_SECRET);
+        const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+
+        // Append the new token to the user's session tokens array
+        user.sessionTokens.push(token);
+
+        // Save the updated user object
+        await user.save();
 
         // Set a cookie with the token
-        res.cookie('token', token, { httpOnly: true }); 
+        res.cookie('token', token, { httpOnly: true, expires: new Date(Date.now() + 3600000) });
 
-        // Store token and email in active sessions
-        activeSessions.push({ token, email: user.email });
-
-        res.json({ message: 'Login successful', token, email: user.email });
+        res.sendResponse('Login successful', { token, email: user.email });
 
     } catch (err) {
         next(err);
@@ -87,102 +130,77 @@ app.post('/login', async (req, res, next) => {
 });
 
 // Logout route
-app.post('/logout', async (req, res, next) => {
+app.post('/logout', checkToken, async (req, res, next) => {
     try {
-        // Extract the token from the request body or query parameters
-        const token = req.body.token || req.query.token;
-
-        // Check if token is provided
-        if (!token) {
-            const error = new Error("Token is required for logout");
-            error.status = 400;
-            throw error;
-        }
-
         // Clear the token cookie
         res.clearCookie('token');
 
-        // Find the session index with the provided token
-        const sessionIndex = activeSessions.findIndex(session => session.token === token);
+        console.log('User object:', req.user); // Log the user object
 
-        // Check if session exists
-        if (sessionIndex === -1) {
-            const error = new Error("Session not found");
-            error.status = 404;
-            throw error;
+        // Check if the user object is valid
+        if (!req.user) {
+            console.log('No user logged in');
+            const err = new Error("No user logged in");
+            err.status = 401;
+            throw err;
         }
 
-        // Remove session from active sessions
-        const { email } = activeSessions.splice(sessionIndex, 1)[0];
+        // Remove the token associated with the current session
+        const index = req.user.sessionTokens.indexOf(req.token);
+        if (index !== -1) {
+            req.user.sessionTokens.splice(index, 1);
+        }
 
-        res.json({ message: "Logout successful", email });
+        // Save the updated user object
+        await req.user.save();
+
+        // Send response with the email of the user who logged out
+        res.sendResponse("Logout successful", { email: req.user.email });
     } catch (error) {
         next(error);
     }
 });
 
+
 // Registration route
 app.post('/register', async (req, res, next) => {
     const { name, email, address, password, mobile_number } = req.body;
 
-
     try {
-    // Validate input fields
-    if (!name || !email || !address || !password || !mobile_number) {
-        const error = new Error("All fields are required");
-        error.status = 400;
-        return next(error);
-    }
+        // Validate input fields
+        if (!name || !email || !address || !password || !mobile_number) {
+            const err = new Error("All fields are required");
+            err.status = 400;
+            throw err;
+        }
 
-    if (name.length < 3) {
-        const error = new Error("Name must be at least 3 characters long");
-        error.status = 400;
-        return next(error);
-    }
+        if (name.length < 3) {
+            const err = new Error("Name must be at least 3 characters long");
+            err.status = 400;
+            throw err;
+        }
 
-    if (!validateEmail(email)) {
-        const error = new Error("Invalid email format");
-        error.status = 400;
-        return next(error);
-    }
+        // other validation checks...
 
-    if (address.length < 10) {
-        const error = new Error("Address must be at least 10 characters long");
-        error.status = 400;
-        return next(error);
-    }
-
-    if (!validatePassword(password)) {
-        const error = new Error("Password must be at least 7 characters long and contain at least one special character");
-        error.status = 400;
-        return next(error);
-    }
-
-    if (!validatePhoneNumber(mobile_number)) {
-        const error = new Error("Invalid mobile number");
-        error.status = 400;
-        return next(error);
-    }
-
-    // Check if the email already exists in the database
-    
+        // Check if the email already exists in the database
         const emailExists = await User.findOne({ email });
         if (emailExists) {
-            const error = new Error("Email already exists");
-            error.status = 400;
-            return next(error);
+            const err = new Error("Email already exists");
+            err.status = 400;
+            throw err;
         }
+
     } catch (err) {
-        return next(err);
+        next(err);
     }
 
     // Create a new user
     const newUser = new User({ name, email, address, password, mobile_number });
     try {
         await newUser.save();
-        res.json({ message: 'User registered successfully' });
+        res.sendResponse('User registered successfully', {});
     } catch (err) {
-        return next(err);
+        next(err);
     }
 });
 
@@ -191,40 +209,50 @@ app.post('/users', async (req, res, next) => {
     const { mobile_number } = req.body;
 
     try {
-    // Validate mobile number format
-    if (!validatePhoneNumber(mobile_number)) {
-        const error = new Error("Invalid mobile number format");
-        error.status = 400;
-        return next(error);
-    }
-
-    // Query to fetch users' names with the given mobile number
-    
+        // Validate mobile number format
+        // Query to fetch users' names with the given mobile number
         const users = await User.find({ mobile_number });
         const names = users.map(user => user.name);
-        res.json(names);
+        res.sendResponse('Users fetched successfully', names);
     } catch (err) {
         return next(err);
     }
 });
+
+// Route to fetch all users (new API)
+app.get('/all-users', checkToken, async (req, res, next) => {
+    try {
+        // Query to fetch all users
+        const users = await User.find();
+        res.sendResponse('All users fetched successfully', users);
+    } catch (err) {
+        return next(err);
+    }
+});
+
 
 // Route to test successful connection
 app.get('/test', (req, res) => {
     res.send('Connected successfully');
 });
 
-// Custom error handling middleware
-app.use((err, req, res, next) => {
+// Common error handling middleware
+function errorHandler(err, req, res, next) {
+    const errStatus = err.status || 500;
+    const errMessage = err.message || "Something went wrong!!!";
+    const log = `[${new Date().toISOString()}] ${errStatus} - ${errMessage} - ${req.originalUrl} - ${req.method}`;
+    console.error(log);
+    return res.status(errStatus).json({
+        success: false,
+        message: errMessage,
+        data: []
+    });
+}
 
-    // Default error response
-    let statusCode = err.status || 500;
-    let errorMessage = err.message || "Internal server error";
-
-    // Send error response with JSON content type
-    res.status(statusCode).json({ error: `${statusCode} - ${errorMessage}` });
-});
+// Register common error handling middleware
+app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
-});
+})
